@@ -69,22 +69,38 @@ local STAR_X = 36.92
 local STAR_TOP = 631.18
 local RATING_TEXT_GAP = 8
 local RATING_TEXT_SIZE = 30
-local RATING_LABELS = { "很差", "较差", "一般", "还好", "完美" }
+-- One label per 0.5 step (0.5 .. 5.0). Index = floor(rating * 2).
+local RATING_LABELS = {
+    "糟糕", -- 0.5
+    "很差", -- 1.0
+    "偏差", -- 1.5
+    "较差", -- 2.0
+    "一般", -- 2.5
+    "还行", -- 3.0
+    "还好", -- 3.5
+    "很好", -- 4.0
+    "极好", -- 4.5
+    "完美", -- 5.0
+}
 local RATING_DEFAULT_TEXT = "点评"
 local STAR_TOUCH_EXPAND = 20
 local MIN_STAR_SIZE = 8
+-- Left portion of each star counts as a half-star tap. Slightly wider than
+-- 50% so half-stars are easier to hit on an e-ink screen.
+local HALF_STAR_ZONE_RATIO = 0.55
 
 local function normalizeRating(rating)
     local r = tonumber(rating) or 0
     if r <= 0 then return 0 end
-    r = math.floor(r * 2 + 0.0001) / 2
+    r = math.floor(r * 2 + 0.5) / 2
     if r > STAR_COUNT then r = STAR_COUNT end
     return r
 end
 
 local function ratingLabelText(rating)
     if rating <= 0 then return RATING_DEFAULT_TEXT end
-    local idx = math.min(#RATING_LABELS, math.max(1, math.ceil(rating - 0.001)))
+    local idx = math.floor(rating * 2 + 0.001)
+    idx = math.min(#RATING_LABELS, math.max(1, idx))
     return RATING_LABELS[idx]
 end
 
@@ -97,20 +113,37 @@ local function starIconKind(rating, index)
     return "empty"
 end
 
-local function ratingFromTapX(tx)
-    local offset_x_inner = tx - STAR_X
-    if offset_x_inner < 0 then
+-- Map a design-coordinate tap to a rating, or nil when the tap is not on the
+-- star row. Left part of a star -> half increment; right part -> full star.
+local function ratingFromTapXY(tx, ty)
+    if ty < STAR_TOP - STAR_TOUCH_EXPAND or ty > STAR_TOP + STAR_SIZE + STAR_TOUCH_EXPAND then
+        return nil
+    end
+
+    local star_total_w = STAR_COUNT * STAR_SIZE + (STAR_COUNT - 1) * STAR_GAP
+    local offset_x = tx - STAR_X
+    -- Keep the same generous touch envelope the row had before half-stars:
+    -- STAR_TOUCH_EXPAND past either end still counts, so the first and last
+    -- star stay easy to hit. Beyond that the tap isn't ours - returning nil
+    -- (rather than 0) matters, because the caller treats 0 as "clear the
+    -- rating" and would otherwise wipe it on a tap meant to dismiss.
+    if offset_x < -STAR_TOUCH_EXPAND or offset_x > star_total_w + STAR_TOUCH_EXPAND then
+        return nil
+    end
+    if offset_x < 0 then
         return 0
     end
 
     local slot_w = STAR_SIZE + STAR_GAP
-    local slot_idx = math.floor(offset_x_inner / slot_w) + 1
-    if slot_idx > STAR_COUNT then
-        return STAR_COUNT
+    local slot_idx = math.min(math.floor(offset_x / slot_w) + 1, STAR_COUNT)
+
+    local in_slot = offset_x - (slot_idx - 1) * slot_w
+    if in_slot > STAR_SIZE then
+        -- In the 2px gap after a star: treat as the full star just before it.
+        return slot_idx
     end
 
-    local in_slot = offset_x_inner - (slot_idx - 1) * slot_w
-    if in_slot <= STAR_SIZE / 2 then
+    if in_slot < STAR_SIZE * HALF_STAR_ZONE_RATIO then
         return slot_idx - 0.5
     end
     return slot_idx
@@ -739,7 +772,22 @@ local function collectData(ctx, opts)
         id_book = lookupBookId(doc_settings, lastfile, props)
     end
 
-    if not for_screensaver and stats and stats.insertDB then
+    -- Flush pending in-memory page stats before reading them back.
+    --
+    -- KOReader already does this on suspend, but too late for us: the chain is
+    -- Device:_beforeSuspend -> "Suspend" event -> ReaderStatistics:onSuspend ->
+    -- insertDB, and _beforeSuspend only runs *after* Screensaver:setup/show
+    -- (generic/device.lua:364-365). So the lock screen used to query a database
+    -- that was still missing the session it was about to report on, which is
+    -- why the first lock showed stale today/total figures and the second one
+    -- looked correct - it was benefiting from the previous suspend's flush.
+    --
+    -- This is not an extra write: insertDB() ends with resetVolatileStats(), so
+    -- KOReader's own flush moments later finds nothing pending and turns into a
+    -- no-op. We're moving the write earlier, not adding one. It also self-skips
+    -- when no book is open (it returns immediately unless id_curr_book is set),
+    -- which covers the screensaver-from-lastfile case.
+    if stats and stats.insertDB then
         pcall(function() stats:insertDB() end)
     end
 
@@ -875,27 +923,61 @@ end
 -- never display them bigger than the screen. Downscale once, here, so the
 -- cache footprint is bounded by the screen size no matter which book is open,
 -- and so we don't redo that scaling on every single suspend.
-local function downscaleToScreen(cover_bb)
+-- Resize a cover, once, into precisely the bitmap the screensaver will blit:
+-- centre-cropped to the screen's aspect ratio, then scaled to exactly the
+-- screen's size. No distortion, no margins.
+--
+-- Doing it here rather than at paint time is what keeps locking fast. Because
+-- the result is exactly Screen:getWidth() x getHeight(), ImageWidget's
+-- scale_factor = 0 resolves to min(sw/bb_w, sh/bb_h) = 1, and it only resamples
+-- when that factor differs from 1 - so the lock screen is a plain blit. Passing
+-- integer sw/sh (rather than a computed float) is what guarantees the exact 1.
+--
+-- Capping at screen size also bounds memory: embedded covers are routinely
+-- 2000x3000, i.e. ~24MB at 4 bytes/pixel held in RAM for a bitmap we would
+-- never display that large.
+local function fillCoverToScreen(cover_bb)
     if not cover_bb or not cover_bb.getWidth then return cover_bb end
-    local ok, scaled = pcall(function()
+    local ok, resized = pcall(function()
         local bw, bh = cover_bb:getWidth(), cover_bb:getHeight()
         local sw, sh = Screen:getWidth(), Screen:getHeight()
-        if bw <= sw and bh <= sh then
-            return cover_bb
+        if bw < 1 or bh < 1 or sw < 1 or sh < 1 then return nil end
+
+        -- Largest centred sub-rectangle of the cover having the screen's aspect
+        -- ratio. Cross-multiplied to keep the comparison in integer arithmetic.
+        local cw, ch = bw, bh
+        if bw * sh > bh * sw then
+            cw = math.max(1, math.floor(bh * sw / sh + 0.5))
+        elseif bw * sh < bh * sw then
+            ch = math.max(1, math.floor(bw * sh / sw + 0.5))
         end
-        local factor = math.min(sw / bw, sh / bh)
-        -- free_orig_bb = true: we own every blitbuffer that reaches this point
-        -- (each loadCover strategy hands us a freshly built one).
-        return RenderImage:scaleBlitBuffer(cover_bb, bw * factor, bh * factor, true)
+
+        local cropped
+        if cw ~= bw or ch ~= bh then
+            cropped = Blitbuffer.new(cw, ch, cover_bb:getType())
+            cropped:blitFrom(cover_bb, 0, 0,
+                math.floor((bw - cw) / 2), math.floor((bh - ch) / 2), cw, ch)
+        end
+
+        -- free_orig_bb = false even though we do own the source: should anything
+        -- here throw, the caller must still be handed a live blitbuffer, because
+        -- a freed cache entry means a use-after-free on the next screensaver.
+        -- The originals are released below, once we have a result in hand.
+        local result = RenderImage:scaleBlitBuffer(cropped or cover_bb, sw, sh, false)
+        if cropped and result ~= cropped then
+            cropped:free()
+        end
+        return result
     end)
-    if ok and scaled then
-        return scaled
+    if ok and resized and resized ~= cover_bb then
+        cover_bb:free()
+        return resized
     end
     return cover_bb
 end
 
 local function rememberCover(file, cover_bb, full_res)
-    cover_bb = downscaleToScreen(cover_bb)
+    cover_bb = fillCoverToScreen(cover_bb)
     if file and cover_bb then
         for existing_file in pairs(cover_cache) do
             if existing_file ~= file then
@@ -1284,14 +1366,9 @@ function Receipt:onTap(arg, ges)
         return true
     end
 
-    local star_total_w = STAR_COUNT * STAR_SIZE + (STAR_COUNT - 1) * STAR_GAP
-    local star_x1 = STAR_X - STAR_TOUCH_EXPAND
-    local star_x2 = STAR_X + star_total_w + RATING_TEXT_GAP + 100 + STAR_TOUCH_EXPAND
-    local star_y1 = STAR_TOP - STAR_TOUCH_EXPAND
-    local star_y2 = STAR_TOP + STAR_SIZE + STAR_TOUCH_EXPAND
-
-    if tx >= star_x1 and tx <= star_x2 and ty >= star_y1 and ty <= star_y2 then
-        local new_rating = normalizeRating(ratingFromTapX(tx))
+    local new_rating_raw = ratingFromTapXY(tx, ty)
+    if new_rating_raw ~= nil then
+        local new_rating = normalizeRating(new_rating_raw)
 
         if new_rating == self.rating and self.rating > 0 then
             self.rating = 0
@@ -1813,11 +1890,16 @@ if ok_ss then
             image_disposable = false,
             width = Screen:getWidth(),
             height = Screen:getHeight(),
-            -- scale_factor 0 = "best fit, keep aspect ratio". ImageWidget does
-            -- its own centering via offsets when width/height are given, so no
-            -- extra container is needed.
-            scale_factor = G_reader_settings:isFalse("screensaver_stretch_images") and 0 or nil,
-            stretch_limit_percentage = G_reader_settings:readSetting("screensaver_stretch_limit_percentage"),
+            -- fillCoverToScreen already baked the crop-to-fill into the cached
+            -- bitmap, so scale_factor 0 ("best fit, keep aspect ratio") computes
+            -- exactly 1 here and ImageWidget skips resampling altogether - that
+            -- "nothing left to do" is what makes locking feel instant.
+            --
+            -- It is also the safe reading if a bake ever failed and we're handed
+            -- an odd-sized bitmap: best fit letterboxes it rather than
+            -- distorting it. stretch_limit_percentage is deliberately not
+            -- passed; ImageWidget only consults it when scale_factor is unset.
+            scale_factor = 0,
         }
     end
 
